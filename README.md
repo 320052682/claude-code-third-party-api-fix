@@ -68,4 +68,4 @@ curl -s http://127.0.0.1:4567/v1/messages \
 
 ## 详细文档
 
-查看 [SKILL.md](./SKILL.md) 获取完整配置指南、故障排除和测试方法。
+查看claude-code-third-party-api-fix获取完整配置指南、故障排除和测试方法。
