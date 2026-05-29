@@ -1,5 +1,5 @@
 ---
-name: claude-code-third-party-api-fix
+name: claude-code-third-party-api-fix 
 description: "修复 Claude Code 2.1.154+ 与第三方 Anthropic 兼容 API 的兼容性问题。适用于 MiMo、DeepSeek、智谱等通过 ANTHROPIC_BASE_URL 接入的模型。当用户遇到 system role 错误、第三方模型无法使用、需要配置 Claude Code 使用第三方模型时激活此 skill。"
 metadata:
   version: 1.2.0
