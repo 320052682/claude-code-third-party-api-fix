@@ -1,0 +1,492 @@
+---
+name: claude-code-mimo-fix
+description: "修复 Claude Code 2.1.154+ 与小米 MiMo 模型的兼容性问题。当用户遇到 system role 错误、MiMo 模型无法使用、需要配置 Claude Code 使用第三方模型时激活此 skill。"
+metadata:
+  version: 1.1.0
+  author: Claude Code Assistant
+  tags: [claude-code, mimo, xiaomi, proxy, compatibility, third-party-model]
+---
+
+# Claude Code + MiMo 兼容性修复
+
+## 问题描述
+
+### 触发条件
+- Claude Code 版本 >= 2.1.154
+- 使用小米 MiMo 模型（通过 `ANTHROPIC_BASE_URL` 代理接入）
+- 其他第三方 Anthropic 兼容 API（DeepSeek、智谱等）
+
+### 错误信息
+```
+messages[1].role must be either 'user' or 'assistant', but got 'system'
+```
+
+或 HTTP 400 错误。
+
+### 根本原因
+Claude Code 2.1.154+ 引入 **Lean system prompt** 作为默认配置，改变了 system 消息的传递方式：
+
+**旧格式（< 2.1.154）：**
+```json
+{
+  "system": "你是一个助手",
+  "messages": [
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+**新格式（>= 2.1.154）：**
+```json
+{
+  "messages": [
+    {"role": "system", "content": "你是一个助手"},
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+MiMo 的 Anthropic 兼容端点只接受旧格式，不接受 `messages[]` 中的 `role: "system"`。
+
+### 影响范围
+| 厂商 | 状态 |
+|------|------|
+| Anthropic 原生 API | ✓ 已支持 |
+| 小米 MiMo | ❌ 未适配 |
+| DeepSeek | ❌ 未适配 |
+| 智谱 GLM-5 | ❌ 未适配 |
+| 大多数第三方 | ❌ 未适配 |
+
+---
+
+## 解决方案
+
+使用本地代理在 Claude Code 和 MiMo API 之间转换格式。
+
+### 架构图
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   Claude Code   │      │   本地代理       │      │    MiMo API     │
+│   (154+)        │ ───> │   (端口 4567)    │ ───> │                 │
+│                 │      │                 │      │                 │
+│ messages: [     │      │ 1. 提取system   │      │ system: [...]   │
+│   {role:system} │      │ 2. 放到顶层     │      │ messages: [     │
+│   {role:user}   │      │ 3. 转发请求     │      │   {role:user}   │
+│ ]               │      │                 │      │ ]               │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+```
+
+---
+
+## 完整配置步骤
+
+### 步骤 1：设置环境变量
+
+在 `~/.zshrc`（或 `~/.bashrc`）中添加：
+
+```bash
+# ============================================================
+# MiMo + Claude Code 配置
+# ============================================================
+
+# MiMo API 密钥（从 https://platform.xiaomimimo.com 获取）
+export MIMO_API_KEY="your-mimo-api-key-here"
+
+# Claude Code 配置 - 指向本地代理（不要直接指向远端）
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4567"
+export ANTHROPIC_AUTH_TOKEN="$MIMO_API_KEY"
+
+# 模型配置 - 所有角色都指向 mimo-v2.5-pro
+export ANTHROPIC_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="mimo-v2.5-pro"
+export CLAUDE_CODE_SUBAGENT_MODEL="mimo-v2.5-pro"
+
+# 可选：effort 级别
+export CLAUDE_EFFORT="high"
+```
+
+**重要：** `ANTHROPIC_BASE_URL` 必须指向本地代理 `http://127.0.0.1:4567`，不能直接指向 MiMo 远端。
+
+### 步骤 2：创建代理脚本
+
+创建文件 `~/.claude/claude-mimo-proxy.js`：
+
+```javascript
+#!/usr/bin/env node
+/**
+ * claude-mimo-proxy
+ * 
+ * 修复 Claude Code 2.1.154+ 与 MiMo API 的兼容性问题。
+ * 
+ * 功能：
+ * - 接收 Claude Code 的请求
+ * - 将 messages[] 中的 role:"system" 消息提取到顶层 system 字段
+ * - 转发到 MiMo API
+ * - 返回响应给 Claude Code
+ * 
+ * 用法：
+ *   node claude-mimo-proxy.js &
+ * 
+ * 环境变量：
+ *   PORT - 代理端口（默认 4567）
+ *   MIMO_BASE_URL - MiMo API 地址（默认 https://token-plan-sgp.xiaomimimo.com）
+ */
+
+const http = require('http');
+const https = require('https');
+
+// ============================================================
+// 配置
+// ============================================================
+const MIMO_BASE = process.env.MIMO_BASE_URL || 'https://token-plan-sgp.xiaomimimo.com';
+const PORT = parseInt(process.env.PORT || '4567', 10);
+const MIMO_HOSTNAME = new URL(MIMO_BASE).hostname;
+
+// ============================================================
+// 核心函数：修复请求体
+// ============================================================
+function fixRequestBody(body) {
+  try {
+    const data = JSON.parse(body);
+    
+    // 如果没有 messages 数组，直接返回
+    if (!Array.isArray(data.messages)) {
+      return body;
+    }
+
+    // 分离 system 消息和其他消息
+    const systemParts = [];
+    const cleanMessages = [];
+
+    for (const msg of data.messages) {
+      if (msg.role === 'system') {
+        // 提取 system 消息内容
+        if (typeof msg.content === 'string') {
+          systemParts.push(msg.content);
+        } else if (Array.isArray(msg.content)) {
+          // 处理 content blocks 格式
+          for (const block of msg.content) {
+            if (typeof block === 'string') {
+              systemParts.push(block);
+            } else if (block.type === 'text' && block.text) {
+              systemParts.push(block.text);
+            }
+          }
+        }
+      } else {
+        // 保留 user 和 assistant 消息
+        cleanMessages.push(msg);
+      }
+    }
+
+    // 如果有 system 消息，合并到顶层 system 字段
+    if (systemParts.length > 0) {
+      // 合并已有的 system 字段
+      const existing = data.system;
+      if (typeof existing === 'string') {
+        systemParts.unshift(existing);
+      } else if (Array.isArray(existing)) {
+        for (const block of existing) {
+          if (typeof block === 'string') {
+            systemParts.unshift(block);
+          } else if (block.type === 'text' && block.text) {
+            systemParts.unshift(block.text);
+          }
+        }
+      }
+
+      // 设置为 Anthropic 格式的 system 字段
+      data.system = systemParts.map(text => ({ type: 'text', text }));
+      data.messages = cleanMessages;
+    }
+
+    return JSON.stringify(data);
+  } catch (e) {
+    // 解析失败，原样返回
+    console.error('[proxy] Failed to parse request body:', e.message);
+    return body;
+  }
+}
+
+// ============================================================
+// 转发请求
+// ============================================================
+function forwardRequest(clientReq, clientRes) {
+  let body = [];
+
+  clientReq.on('data', chunk => body.push(chunk));
+  
+  clientReq.on('end', () => {
+    const rawBody = Buffer.concat(body).toString('utf8');
+    const fixedBody = fixRequestBody(rawBody);
+
+    // 构建目标路径
+    const targetPath = clientReq.url.startsWith('/anthropic')
+      ? clientReq.url
+      : '/anthropic' + clientReq.url;
+
+    // 构建请求选项
+    const options = {
+      hostname: MIMO_HOSTNAME,
+      port: 443,
+      path: targetPath,
+      method: clientReq.method,
+      headers: {
+        ...clientReq.headers,
+        host: MIMO_HOSTNAME,
+      },
+    };
+
+    // 更新 content-length（因为 body 可能已改变）
+    delete options.headers['content-length'];
+    options.headers['content-length'] = Buffer.byteLength(fixedBody);
+
+    // 发送请求到 MiMo API
+    const proxyReq = https.request(options, (proxyRes) => {
+      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(clientRes);
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('[proxy] Error forwarding request:', err.message);
+      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: err.message }
+      }));
+    });
+
+    proxyReq.write(fixedBody);
+    proxyReq.end();
+  });
+}
+
+// ============================================================
+// 启动服务器
+// ============================================================
+const server = http.createServer((req, res) => {
+  console.log(`[proxy] ${new Date().toISOString()} ${req.method} ${req.url}`);
+  forwardRequest(req, res);
+});
+
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`[proxy] ==========================================`);
+  console.log(`[proxy] claude-mimo-proxy started`);
+  console.log(`[proxy] Listening on: http://127.0.0.1:${PORT}`);
+  console.log(`[proxy] Forwarding to: ${MIMO_BASE}`);
+  console.log(`[proxy] ==========================================`);
+  console.log(`[proxy] Set in ~/.zshrc:`);
+  console.log(`[proxy]   export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"`);
+  console.log(`[proxy] ==========================================`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[proxy] ERROR: Port ${PORT} is already in use`);
+    console.error(`[proxy] Run: lsof -i :${PORT} && kill -9 <PID>`);
+  } else {
+    console.error('[proxy] Server error:', err);
+  }
+  process.exit(1);
+});
+```
+
+### 步骤 3：启动代理
+
+```bash
+# 启动代理（后台运行）
+node ~/.claude/claude-mimo-proxy.js &
+
+# 验证代理运行
+curl -s http://127.0.0.1:4567
+# 应返回 404（正常，根路径无服务）
+```
+
+### 步骤 4：重新加载环境变量
+
+```bash
+source ~/.zshrc
+```
+
+### 步骤 5：重启 Claude Code
+
+```bash
+# 退出当前会话
+exit
+
+# 重新启动
+claude
+```
+
+---
+
+## 故障排除
+
+### 问题 1：代理无法启动（端口占用）
+
+**错误信息：**
+```
+Error: listen EADDRINUSE 127.0.0.1:4567
+```
+
+**解决方案：**
+```bash
+# 查找占用端口的进程
+lsof -i :4567
+
+# 杀掉进程
+kill -9 <PID>
+
+# 重新启动代理
+node ~/.claude/claude-mimo-proxy.js &
+```
+
+### 问题 2：Claude Code 仍报 system role 错误
+
+**可能原因：**
+- 环境变量未生效
+- 代理未运行
+- 指向了错误的地址
+
+**排查步骤：**
+```bash
+# 1. 检查代理是否运行
+ps aux | grep claude-mimo-proxy
+
+# 2. 检查环境变量
+echo $ANTHROPIC_BASE_URL
+# 应输出：http://127.0.0.1:4567
+
+# 3. 如果环境变量不对，重新加载
+source ~/.zshrc
+
+# 4. 或手动设置
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4567"
+
+# 5. 重启 Claude Code
+```
+
+### 问题 3：代理运行但请求超时
+
+**可能原因：**
+- 网络问题
+- MiMo API 不可达
+
+**排查步骤：**
+```bash
+# 测试 MiMo API 连通性
+curl -I https://token-plan-sgp.xiaomimimo.com
+
+# 测试代理是否响应
+curl -s http://127.0.0.1:4567
+
+# 查看代理日志（看是否有错误）
+# 代理日志会输出到启动代理的终端
+```
+
+### 问题 4：API Key 错误
+
+**错误信息：**
+```
+401 Unauthorized
+```
+
+**解决方案：**
+```bash
+# 检查 API Key 是否正确设置
+echo $MIMO_API_KEY
+echo $ANTHROPIC_AUTH_TOKEN
+
+# 确保两者相同
+export MIMO_API_KEY="your-correct-api-key"
+export ANTHROPIC_AUTH_TOKEN="$MIMO_API_KEY"
+```
+
+---
+
+## 测试验证
+
+### 测试 1：代理基本响应
+
+```bash
+curl -s http://127.0.0.1:4567
+# 应返回 404（正常）
+```
+
+### 测试 2：完整 API 请求
+
+```bash
+curl -s http://127.0.0.1:4567/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $MIMO_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "max_tokens": 100,
+    "messages": [
+      {"role": "system", "content": "你是一个助手"},
+      {"role": "user", "content": "你好"}
+    ]
+  }'
+```
+
+**期望响应：**
+```json
+{
+  "id": "...",
+  "type": "message",
+  "role": "assistant",
+  "model": "mimo-v2.5-pro",
+  "content": [...],
+  ...
+}
+```
+
+### 测试 3：检查环境变量
+
+```bash
+echo "ANTHROPIC_BASE_URL: $ANTHROPIC_BASE_URL"
+echo "ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:0:10}..."
+echo "ANTHROPIC_MODEL: $ANTHROPIC_MODEL"
+```
+
+---
+
+## 可用 MiMo 模型
+
+| 模型 ID | 说明 |
+|---------|------|
+| `mimo-v2.5-pro` | 最强推理能力（推荐） |
+| `mimo-v2.5` | 平衡性能与速度 |
+| `mimo-v2.5-tts` | 语音合成 |
+| `mimo-v2.5-tts-voicedesign` | 音色设计 |
+| `mimo-v2.5-tts-voiceclone` | 音色克隆 |
+
+---
+
+## 相关链接
+
+- [小米 MiMo 开放平台](https://platform.xiaomimimo.com)
+- [MiMo Studio 体验](https://aistudio.xiaomimimo.com)
+- [MiMo Skills GitHub](https://github.com/XiaomiMiMo/MiMo-Skills)
+- [Claude Code 文档](https://docs.anthropic.com/en/docs/claude-code)
+- [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
+
+---
+
+## 更新日志
+
+### v1.1.0 (2026-05-29)
+- 增加详细的架构图
+- 增加详细的故障排除步骤
+- 增加详细的测试验证
+- 增加环境变量说明
+- 增加错误处理说明
+
+### v1.0.0 (2026-05-29)
+- 初始版本
+- 基本配置指南
+- 代理脚本
